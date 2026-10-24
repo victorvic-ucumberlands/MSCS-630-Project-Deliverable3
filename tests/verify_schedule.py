@@ -259,7 +259,7 @@ check(tied == tied_arrivals,
 print("\nPreemption run (a more urgent process is created mid-run):")
 out = run_shell([
     f"sched add -p 8 {links['alpha']} alpha 400 100",
-    f"sched add -p 4 -t 150 {links['bravo']} bravo 150 50",
+    f"sched add -p 4 -t 150 {links['bravo']} bravo 250 50",
     f"sched add -p 0 -t 300 {links['charlie']} charlie 100 50",
     "sched run priority",
 ])

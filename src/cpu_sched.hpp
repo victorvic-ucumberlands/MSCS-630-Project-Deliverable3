@@ -116,6 +116,12 @@ char state(pid_t pid);             // kernel state of one process: R S D T Z ...
 // A job's leader is often a shell waiting for its children, so looking at the
 // leader alone would mistake a busy job for a blocked one.
 bool tree_runnable(pid_t pid);
+// The same walk with help from the shell's system-call server (Deliverable 3):
+// hint(pid) is 0 for a process asleep waiting for the shell (a semaphore, page
+// I/O), 1 for one whose request is queued for the shell (it is "in a system
+// call", so it counts as running), -1 = look at /proc.
+enum class TreeState { Runnable, Idle, WaitingForShell };
+TreeState tree_state(pid_t pid, const std::function<int(pid_t)>& hint);
 }  // namespace proc
 
 // ---------------------------------------------------------------------------
@@ -137,6 +143,14 @@ class CpuScheduler {
   // The process turned out to be stopped by somebody else (Ctrl-Z) when the
   // engine stopped it; it has been dropped from scheduling.
   std::function<void(Job&, int sig)> user_stopped;
+  // Deliverable 3: what the shell's system-call server knows about a process
+  // (see proc::tree_state) and, for the event log, what it is waiting for.
+  // A process asleep waiting for the shell is marked BLOCKED at the next
+  // tick without waiting for a second probe.
+  std::function<int(pid_t)> pid_hint;
+  std::function<std::string(pid_t)> wait_reason;
+  void reprobe();                          // probe every process at the next tick
+  void wake(pid_t pid);                    // the shell is about to wake `pid` (it was Blocked)
 
   void configure(const CpuConfig& cfg);    // change policy; the ready queue is rebuilt
   const CpuConfig& config() const { return cfg_; }
@@ -190,6 +204,7 @@ class CpuScheduler {
   void open_idle(long now);
   void enter_ready(CpuEntry* e, long now);
   void give_cpu(CpuEntry* e, long now, bool send_cont);
+  void wake_entry(CpuEntry* e, long now, const char* why);
   void segment(GanttSegment::Kind k, int tag, long s, long e);
   void emit(const char* kind, const std::string& detail);
 

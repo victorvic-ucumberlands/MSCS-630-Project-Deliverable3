@@ -194,8 +194,10 @@ int cmd_ps(Shell& sh) {
     }
     char job[16];
     snprintf(job, sizeof job, "[%d]", j->id);
-    printf("  %-5s %-7d %4d  %-9s %6c %9ld %9ld %9ld %6d  %s\n", job, (int)j->pid, j->priority, st.c_str(),
-           proc::state(j->pid), held, wait, block, j->dispatches, j->command.c_str());
+    std::string why = sh.kern.wait_reason(j->pid);     // Deliverable 3: asleep in a system call
+    printf("  %-5s %-7d %4d  %-9s %6c %9ld %9ld %9ld %6d  %s%s\n", job, (int)j->pid, j->priority, st.c_str(),
+           proc::state(j->pid), held, wait, block, j->dispatches, j->command.c_str(),
+           why.empty() ? "" : ("   <- waits for " + why).c_str());
   }
   if (sh.live) printf("ready queue (service order): %s\n", sh.cpu.ready_text().c_str());
   return 0;
@@ -317,7 +319,7 @@ int cmd_run(Shell& sh, const Args& a) {
   if (cfg.trace) printf("%7s  %-8s %-44s %s\n", "TIME", "EVENT", "DETAIL", "READY QUEUE");
   fflush(stdout);
 
-  SchedResult r = sh.scheduler.run(cfg, stdout, sh.cpu);
+  SchedResult r = sh.scheduler.run(cfg, stdout, sh.cpu, &sh.kern);
   Scheduler::print_report(r, stdout);
   // An interrupted run reports 128+signal, the convention used for any job
   // that ended because of a signal.
@@ -372,7 +374,7 @@ int cmd_compare(Shell& sh, const Args& a) {
   SchedResult last;
   bool have = false;
   for (const Row& row : rows) {
-    SchedResult r = sh.scheduler.run(row.cfg, stdout, sh.cpu);
+    SchedResult r = sh.scheduler.run(row.cfg, stdout, sh.cpu, &sh.kern);
     printf("  %-24s %9.1f %9.1f %9.1f %9d %9ld %6.1f%%\n", row.label.c_str(), r.avg_waiting_ms(),
            r.avg_turnaround_ms(), r.avg_response_ms(), r.context_switches, r.makespan_ms, r.cpu_utilization());
     fflush(stdout);

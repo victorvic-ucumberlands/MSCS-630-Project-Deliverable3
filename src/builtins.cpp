@@ -641,6 +641,8 @@ static int builtin_help(Shell&, const Args&) {
        "  prio N COMMAND      run COMMAND with scheduling priority N (0-99, lower = more urgent)\n"
        "  prio N %job         change the priority of a job\n"
        "  sched ...           the CPU scheduler: policy, ps, trace, experiments (sched help)\n"
+       "  mem ...             paged memory: frames, page tables, faults, replacement (mem help)\n"
+       "  sem ...             semaphores and mutexes for processes (sem help)\n"
        "  exit [code]         leave the shell\n"
        "syntax: cmd &   cmd1 ; cmd2   > >> < 2>   'quotes' \"quotes\"   $VAR $? $$   # comment");
   return 0;
@@ -656,7 +658,8 @@ BuiltinFn find_builtin(const std::string& name) {
       {"cat", builtin_cat},     {"mkdir", builtin_mkdir}, {"rmdir", builtin_rmdir},
       {"rm", builtin_rm},       {"touch", builtin_touch}, {"kill", builtin_kill},
       {"jobs", builtin_jobs},   {"fg", builtin_fg},       {"bg", builtin_bg},
-      {"help", builtin_help},   {"sched", builtin_sched}};
+      {"help", builtin_help},   {"sched", builtin_sched},
+      {"mem", builtin_mem},     {"sem", builtin_sem}};
   auto it = table.find(name);
   return it == table.end() ? nullptr : it->second;
 }

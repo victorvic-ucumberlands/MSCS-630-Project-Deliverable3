@@ -12,6 +12,7 @@
 
 #include "cpu_sched.hpp"
 #include "job.hpp"
+#include "kernel.hpp"
 #include "parser.hpp"
 #include "scheduler.hpp"
 
@@ -30,6 +31,7 @@ class Shell {
   JobTable jobs;
   CpuScheduler cpu;            // the resident scheduler: every command the shell starts goes through it
   Scheduler scheduler;         // `sched run` experiments (built on `cpu`)
+  Kernel kern;                 // Deliverable 3: paged memory and semaphores for the shell's processes
   bool live = true;            // false = the kernel schedules the jobs (Deliverable 1 behaviour)
   int default_priority = 10;   // priority given to commands started without `prio`
   bool live_trace = false;     // print scheduling decisions as they happen

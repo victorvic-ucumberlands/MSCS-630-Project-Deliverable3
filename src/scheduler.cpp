@@ -5,7 +5,9 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <poll.h>
 #include <sys/resource.h>
+#include <sys/signalfd.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -14,6 +16,8 @@
 #include <cerrno>
 #include <cmath>
 #include <cstring>
+
+#include "kernel.hpp"
 
 namespace {
 long ms_of(const struct timeval& tv) { return tv.tv_sec * 1000L + tv.tv_usec / 1000L; }
@@ -67,7 +71,7 @@ bool Scheduler::remove(int id) {
 // ===========================================================================
 // The experiment
 // ===========================================================================
-SchedResult Scheduler::run(const SchedConfig& cfg, FILE* out, CpuScheduler& cpu) {
+SchedResult Scheduler::run(const SchedConfig& cfg, FILE* out, CpuScheduler& cpu, Kernel* kern) {
   SchedResult r;
   r.cfg = cfg;
   r.tasks = tasks_;                       // fixed size from here on: the scheduler keeps pointers
@@ -88,6 +92,9 @@ SchedResult Scheduler::run(const SchedConfig& cfg, FILE* out, CpuScheduler& cpu)
   sigemptyset(&watch);
   for (int s : {SIGCHLD, SIGINT, SIGTERM, SIGHUP}) sigaddset(&watch, s);
   sigprocmask(SIG_BLOCK, &watch, &saved_mask);
+  // With the system-call server the wait below is a poll() over its sockets
+  // and a signalfd for the watched signals; without it, sigtimedwait().
+  const int sigfd = kern ? signalfd(-1, &watch, SFD_NONBLOCK | SFD_CLOEXEC) : -1;
 
   // ---- take the CPU for the experiment ----------------------------------
   CpuConfig saved_cfg = cpu.config();
@@ -305,6 +312,28 @@ SchedResult Scheduler::run(const SchedConfig& cfg, FILE* out, CpuScheduler& cpu)
     auto take = [&](long v) { if (v < 0) v = 0; if (t < 0 || v < t) t = v; };
     if (next_pending < n) take(r.tasks[order[next_pending]].arrival_ms - rel());
     take(cfg.budget_ms - rel() + 1);
+    if (sigfd >= 0) {
+      if (long kt = kern->timeout_ms(); kt >= 0) take(kt);
+      std::vector<pollfd> fds{{sigfd, POLLIN, 0}};
+      kern->add_pollfds(fds);
+      poll(fds.data(), fds.size(), (int)std::min<long>(t, 1000000));
+      kern->service(fds.data() + 1, fds.size() - 1);
+      kern->tick();
+      int stop_sig = 0;
+      signalfd_siginfo si;
+      bool chld = false;
+      while (read(sigfd, &si, sizeof si) == (ssize_t)sizeof si) {
+        if (si.ssi_signo == SIGCHLD) chld = true;
+        else stop_sig = (int)si.ssi_signo;
+      }
+      if (chld) reap();
+      if (stop_sig) {
+        r.interrupted = true;
+        r.abort_signal = stop_sig;
+        break;
+      }
+      continue;
+    }
     timespec ts{t / 1000, (t % 1000) * 1000000L};
     siginfo_t info;
     int s = sigtimedwait(&watch, &info, &ts);
@@ -316,6 +345,7 @@ SchedResult Scheduler::run(const SchedConfig& cfg, FILE* out, CpuScheduler& cpu)
       break;
     }
   }
+  if (sigfd >= 0) close(sigfd);
   r.makespan_ms = rel();
 
   // ---- cleanup: never leave a stopped child behind -----------------------

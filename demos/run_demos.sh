@@ -73,7 +73,7 @@ run_demo() {                                   # run_demo <script>
     echo "### scratch dir: $work   shell: $SH"
     echo
   } > "$OUT/$name.log"
-  ( cd "$work" && MYSHELL="$SH" BURN="$ROOT/demos/cpuburn" timeout 300 "$SH" -e "$script" </dev/null >>"$OUT/$name.log" 2>&1
+  ( cd "$work" && MYSHELL="$SH" BURN="$ROOT/demos/cpuburn" DEMOS="$ROOT/demos" timeout 300 "$SH" -e "$script" </dev/null >>"$OUT/$name.log" 2>&1
     rc=$?; echo >>"$OUT/$name.log"; echo "### myshell exit code: $rc" >>"$OUT/$name.log" )
   rm -rf "$work"
   echo "ran $name -> evidence/$name.log"
@@ -95,6 +95,16 @@ done
 if want 14_scheduler_verification; then
   python3 "$ROOT/tests/verify_schedule.py" "$SH" "$ROOT/demos/cpuburn" > "$OUT/14_scheduler_verification.log" 2>&1
   echo "ran scheduler verification -> evidence/14_scheduler_verification.log"
+fi
+
+# ---- Deliverable 3: memory and synchronization experiments, verification ------
+if want 24_memory_perf; then
+  python3 "$DEMOS/24_memory_perf.py" "$SH" "$ROOT/demos" > "$OUT/24_memory_perf.log" 2>&1
+  echo "ran 24_memory_perf -> evidence/24_memory_perf.log"
+fi
+if want 25_memory_verification; then
+  python3 "$ROOT/tests/verify_memory.py" "$SH" "$ROOT/demos" > "$OUT/25_memory_verification.log" 2>&1
+  echo "ran memory verification -> evidence/25_memory_verification.log"
 fi
 
 # ---- automatic checks -------------------------------------------------------
@@ -276,10 +286,77 @@ count_ge() {                                   # count_ge <log> <description> <f
   check 14_scheduler_verification "a foreground command shares the CPU"          "a foreground command shares the CPU with a background job"
   check 14_scheduler_verification "prio preempts at once"                        "prio 1 COMMAND preempts a running default-priority command at once"
   check 13_performance "block detection experiment ran"                          "E6  A CPU-bound and an I/O-bound process together: block detection on and off"
+  # ---- Deliverable 3: paging ----
+  check 17_paging "demand paging: allocation loads nothing"            "not yet in memory: demand paging"
+  check 17_paging "first touch is a minor (zero-fill) fault"           "PAGE FAULT (minor: zero-filled)"
+  check 17_paging "page table shows resident pages and frames"         "Page table of A (pid"
+  check 17_paging "exit releases the address space"                    "address space released, 3 page(s) and 3 frame(s) freed"
+  check 17_paging "overflow: dirty victim written to swap"             "evicted by LRU (dirty, written to swap slot"
+  check 17_paging "overflow: page read back from swap (major)"         "PAGE FAULT (major: read back from swap)"
+  check 17_paging "data survives eviction"                             "B: 10 references, 10 page faults (6 minor, 4 major), hit ratio 0.0%, peak resident 4 of 6 pages, data check OK"
+  check 17_paging "explicit free returns frames"                       "FREE   E: virtual pages 0-1 freed (2 frame(s) returned to the free list)"
+  check 17_paging "allocation beyond RAM + swap refused"               "huge: allocation of 21 pages refused: out of memory (RAM + swap)"
+  check 17_paging "exactly RAM + swap is accepted"                     "ok: 20 references, 20 page faults"
+  check 17_paging "unallocated access -> SIGSEGV"                      "terminated by signal 11 (Segmentation fault)"
+  check 17_paging "a page fault blocks the process (scheduler)"        "waits for page I/O (swap), CPU released"
+  check 17_paging "shared segment counter exact"                       "shared1[0] = 4000"
+  # ---- replacement ----
+  check 18_replacement "FIFO textbook: 15 faults"                      "FIFO     15 page faults"
+  check 18_replacement "LRU textbook: 12 faults"                       "LRU      12 page faults"
+  check 18_replacement "OPT textbook: 9 faults"                        "OPT       9 page faults"
+  check 18_replacement "live FIFO process: 15 faults"                  "fifo: 20 references, 15 page faults"
+  check 18_replacement "live LRU process: 12 faults"                   "lru: 20 references, 12 page faults"
+  check 18_replacement "live Clock process: 14 faults"                 "clock: 20 references, 14 page faults"
+  check 18_replacement "Belady's anomaly found offline"                "FIFO: 4 frames give MORE faults (10) than 3 frames (9): Belady's anomaly"
+  check 18_replacement "Belady live, 3 frames"                         "belady3: 12 references, 9 page faults"
+  check 18_replacement "Belady live, 4 frames"                         "belady4: 12 references, 10 page faults"
+  check_re 18_replacement "frame table shows LRU ranks"                "LRU evicts LRU rank 1 first"
+  absent_sub 18_replacement "no data error"                            "DATA ERROR"
+  # ---- memory errors ----
+  check 19_mem_errors "bad frames rejected"                            "mem config: frames must be 1..4096, got '0'"
+  check 19_mem_errors "page size must be a power of two"               "page size must be a power of two"
+  check 19_mem_errors "geometry locked while in use"                   "mem config: memory is in use"
+  check 19_mem_errors "malformed reference string"                     "mem sim: malformed reference string '1,a,3'"
+  check 19_mem_errors "kernel API edge cases"                          "all cases behaved as specified"
+  check 19_mem_errors "malformed request drops the connection"         "closed the connection (as it should)"
+  check 19_mem_errors "second connection refused"                      "refused (as it should)"
+  check 19_mem_errors "outside myshell"                                "cannot reach the shell's memory manager"
+  check 19_mem_errors "killed process frees all memory"                "committed 0 of 12 pages"
+  count_ge 19_mem_errors "12 processes under pressure: data intact"    "data check OK (0 mismatches)" 26
+  check 19_mem_errors "swap exhausted -> refused"                      "q15: allocation of 3 pages refused: out of memory"
+  check 19_mem_errors "shell survives"                                 "shell alive after every memory error"
+  # ---- synchronization ----
+  check_re 20_race "race: lost updates without a lock"                 "counter in c1 = ([0-8][0-9]{3}|9[0-9]{3})$"
+  check 20_race "mutex: exactly 10000"                                 "counter in c1 = 10000"
+  check 20_race "trace shows a process sleeping on the mutex"          "waits for mutex 'm1' held by"
+  check 20_race "binary semaphore: exactly 6000"                       "counter in c2 = 6000"
+  check 20_race "file race cured by a mutex"                           "counter in count.bin = 6000"
+  check 20_race "a waiter is BLOCKED with its reason"                  "<- waits for semaphore 'gate'"
+  check 21_producer_consumer "producer sleeps when the buffer is full" "(buffer 4/4)"
+  count_ge 21_producer_consumer "synchronized runs correct"            "verdict: CORRECT" 4
+  check 21_producer_consumer "unsynchronized run corrupted"            "verdict: WRONG"
+  check 21_producer_consumer "wrong order: stall reported"             "STALL: all 2 processes using semaphores"
+  check 22_dining "naive: deadlock detected"                           "DEADLOCK detected (5 processes in a cycle)"
+  check 22_dining "robust release breaks the cycle"                    "exited holding mutex 'fork0'; the shell releases it"
+  count_ge 22_dining "ordered and waiter: everyone eats"               "finished 3 meals" 10
+  check 22_dining "deadlock avoided by refusing the lock"              "DEADLOCK avoided: refused"
+  count_ge 22_dining "...and the naive philosophers recover"           "finished 2 meals" 9
+  check 23_sync_errors "only the owner may unlock"                     "only its owner may unlock it"
+  check 23_sync_errors "cannot remove while waited on"                 "sem rm: 'z' has waiting processes"
+  check_re 23_sync_errors "killed waiter leaves the queue"             "q +semaphore +0 +- +[0-9]+,[0-9]+ "
+  check 23_sync_errors "robust mutex"                                  "the previous owner died holding it"
+  check 23_sync_errors "FIFO wake-up order"                            "FIFO order kept"
+  check 23_sync_errors "8 contenders: exact count"                     "counter in many = 8000"
+  check 23_sync_errors "stall reported"                                "STALL: all 2 processes"
+  check 23_sync_errors "shell survives"                                "shell alive after every synchronization error"
+  check 24_memory_perf "memory experiments ran"                        "S3  Dining philosophers"
+  absent_sub 24_memory_perf "live equals offline"                      "DIFFERENT"
+  check 25_memory_verification "all memory/sync properties hold"       "properties hold"
+  absent_sub 25_memory_verification "no failed property"               "FAIL  "
   # leftovers: no orphan sleeps from demo 05 may survive the shell
   # match process names exactly (-x) or anchored command lines, so a shell whose
   # command line merely mentions them is not mistaken for a leftover
-  if pgrep -x cpuburn >/dev/null || pgrep -f '^sleep 424[234]' >/dev/null; then
+  if pgrep -x cpuburn >/dev/null || pgrep -x memproc >/dev/null || pgrep -x philo >/dev/null || pgrep -x pc >/dev/null || pgrep -x counter >/dev/null || pgrep -f '^sleep 424[234]' >/dev/null; then
     echo "FAIL  leftovers          orphan child processes found: $(pgrep -ax cpuburn | head -3)"; FAIL=$((FAIL+1))
   else echo "PASS  leftovers          no orphan or stopped child processes after the shell exits"; PASS=$((PASS+1)); fi
   echo; echo "Result: $PASS passed, $FAIL failed"

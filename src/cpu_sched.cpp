@@ -68,13 +68,19 @@ char state(pid_t pid) {
   return stat_state(path);
 }
 
-bool tree_runnable(pid_t root) {
+bool tree_runnable(pid_t root) { return tree_state(root, nullptr) == TreeState::Runnable; }
+
+TreeState tree_state(pid_t root, const std::function<int(pid_t)>& hint) {
   std::vector<pid_t> todo{root};
+  bool waits_for_shell = false;
   int visited = 0;
   while (!todo.empty() && visited < 512) {
     pid_t p = todo.back();
     todo.pop_back();
     ++visited;
+    int h = hint ? hint(p) : -1;
+    if (h == 1) return TreeState::Runnable;          // its request is queued: it is in a system call
+    if (h == 0) waits_for_shell = true;              // asleep until the shell answers
     char dir[64];
     snprintf(dir, sizeof dir, "/proc/%d/task", (int)p);
     DIR* d = opendir(dir);
@@ -84,7 +90,7 @@ bool tree_runnable(pid_t root) {
       if (t->d_name[0] < '0' || t->d_name[0] > '9') continue;
       char path[384];                              // d_name is at most 255 bytes
       snprintf(path, sizeof path, "%s/%s/stat", dir, t->d_name);
-      if (stat_state(path) == 'R') { runnable = true; break; }   // a thread is on/for a CPU
+      if (h != 0 && stat_state(path) == 'R') { runnable = true; break; }   // a thread is on/for a CPU
       snprintf(path, sizeof path, "%s/%s/children", dir, t->d_name);
       char kids[4096];
       if (slurp(path, kids, sizeof kids) > 0) {    // descendants: "123 456 "
@@ -94,9 +100,14 @@ bool tree_runnable(pid_t root) {
       }
     }
     closedir(d);
-    if (runnable) return true;
+    if (runnable) return TreeState::Runnable;
+    // Asked again AFTER reading its state: if it went to sleep in recv() in
+    // between, its request is now queued for the shell (which is busy right
+    // here, so it cannot have been answered) - it is in a system call, not
+    // blocked.  Asking only before would race with that.
+    if (h == -1 && hint && hint(p) == 1) return TreeState::Runnable;
   }
-  return false;
+  return waits_for_shell ? TreeState::WaitingForShell : TreeState::Idle;
 }
 
 }  // namespace proc
@@ -522,6 +533,49 @@ void CpuScheduler::deliver(Job& pcb, int sig) {
   give_cpu(e, proc::mono_ms(), true);              // ...which happens now
 }
 
+// A Blocked process is runnable again: it takes the idle CPU, or it is
+// stopped and joins the ready queue (where priority preemption may still hand
+// it the CPU in the same tick).
+void CpuScheduler::wake_entry(CpuEntry* e, long now, const char* why) {
+  stats.wakeups++;
+  if (!running_ && !has_ready()) {
+    give_cpu(e, now, false);
+    return;
+  }
+  e->pcb->blocked_ms += std::max(0L, now - e->since_ms);
+  int sig = 0;
+  StopResult r = stop_confirm(e, now, &sig);
+  if (r == StopResult::Stopped) {
+    if (after_stop) after_stop(*e->pcb);
+    enter_ready(e, now);
+    emit("WAKE", name(*e->pcb) + (why ? std::string(": ") + why + "; stopped (SIGSTOP) and queued"
+                                      : std::string(": woke up; stopped (SIGSTOP) and queued")));
+  } else {
+    Job& p = *e->pcb;
+    e->since_ms = now;
+    remove(e);
+    if (r == StopResult::UserStopped && user_stopped) user_stopped(p, sig);
+  }
+}
+
+// The shell is about to answer a request that `pid` sleeps on (a semaphore was
+// posted, its page arrived).  Like a kernel putting a woken task on the run
+// queue, the scheduler decides BEFORE the process can run: if another process
+// holds the CPU it is stopped first, so the two never run side by side.
+void CpuScheduler::wake(pid_t pid) {
+  for (auto& e : entries_) {
+    if (!e.pcb || e.pcb->pid != pid || e.state != CpuEntry::State::Blocked) continue;
+    long now = proc::mono_ms();
+    e.last_probe_ms = now;
+    wake_entry(&e, now, "its system call was answered (woken by the shell)");
+    return;
+  }
+}
+
+void CpuScheduler::reprobe() {
+  for (auto& e : entries_) e.last_probe_ms = 0;
+}
+
 void CpuScheduler::renice(Job& pcb, int priority) {
   pcb.priority = priority;
   CpuEntry* e = find(pcb);
@@ -540,9 +594,11 @@ void CpuScheduler::tick() {
   if (running_ && cfg_.block_detect && now - running_->last_probe_ms >= kProbeMs) {
     CpuEntry* e = running_;
     e->last_probe_ms = now;
-    if (proc::tree_runnable(e->pcb->pid)) {
+    proc::TreeState ts = proc::tree_state(e->pcb->pid, pid_hint);
+    if (ts == proc::TreeState::Runnable) {
       e->idle_probes = 0;
-    } else if (++e->idle_probes >= 2) {
+    } else if (ts == proc::TreeState::WaitingForShell || ++e->idle_probes >= 2) {
+      std::string why = wait_reason ? wait_reason(e->pcb->pid) : "";
       account_running(now);
       e->state = CpuEntry::State::Blocked;
       e->since_ms = now;
@@ -551,8 +607,11 @@ void CpuScheduler::tick() {
       running_ = nullptr;
       open_idle(now);
       stats.blocks++;
-      emit("BLOCK", name(*e->pcb) + ": blocked in the kernel (state " +
-                        std::string(1, proc::state(e->pcb->pid)) + "), CPU released");
+      if (!why.empty())
+        emit("BLOCK", name(*e->pcb) + ": waits for " + why + ", CPU released");
+      else
+        emit("BLOCK", name(*e->pcb) + ": blocked in the kernel (state " +
+                          std::string(1, proc::state(e->pcb->pid)) + "), CPU released");
     }
   }
 
@@ -592,25 +651,8 @@ void CpuScheduler::tick() {
   for (CpuEntry* e : blocked) {
     if (now - e->last_probe_ms < kProbeMs) continue;
     e->last_probe_ms = now;
-    if (!proc::tree_runnable(e->pcb->pid)) continue;
-    stats.wakeups++;
-    if (!running_ && !has_ready()) {
-      give_cpu(e, now, false);
-      continue;
-    }
-    e->pcb->blocked_ms += std::max(0L, now - e->since_ms);
-    int sig = 0;
-    StopResult r = stop_confirm(e, now, &sig);
-    if (r == StopResult::Stopped) {
-      if (after_stop) after_stop(*e->pcb);
-      enter_ready(e, now);
-      emit("WAKE", name(*e->pcb) + ": woke up; stopped (SIGSTOP) and queued");
-    } else {
-      Job& p = *e->pcb;
-      e->since_ms = now;
-      remove(e);
-      if (r == StopResult::UserStopped && user_stopped) user_stopped(p, sig);
-    }
+    if (proc::tree_state(e->pcb->pid, pid_hint) != proc::TreeState::Runnable) continue;
+    wake_entry(e, now, nullptr);
   }
 
   // 4. Priority preemption: a strictly more urgent process is ready.

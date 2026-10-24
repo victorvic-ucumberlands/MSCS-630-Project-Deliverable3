@@ -23,6 +23,8 @@
 #include "cpu_sched.hpp"
 #include "job.hpp"
 
+class Kernel;
+
 // One queued command plus its process-control block.
 struct SchedTask {
   std::vector<std::string> argv;  // the command to exec
@@ -85,7 +87,9 @@ class Scheduler {
 
   // Execute the workload under `cfg` on the shell's scheduler `cpu`.  The
   // queued workload is left untouched, so it can be replayed.
-  SchedResult run(const SchedConfig& cfg, FILE* out, CpuScheduler& cpu);
+  // `kern` (Deliverable 3) is the shell's system-call server: tasks that use
+  // paged memory or semaphores are served while the experiment runs.
+  SchedResult run(const SchedConfig& cfg, FILE* out, CpuScheduler& cpu, Kernel* kern = nullptr);
 
   std::optional<SchedResult> last;
 

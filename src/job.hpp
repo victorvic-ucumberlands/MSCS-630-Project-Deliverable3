@@ -75,6 +75,14 @@ struct Job {
   long cpu_sys_ms = 0;            // system CPU time (from wait4 rusage)
   int  stop_count = 0;            // how many times it was suspended
 
+  // ---- memory (Deliverable 3) --------------------------------------------
+  // The shell's own paging statistics for a process live in the memory
+  // manager (memory.hpp, `mem ps`).  These are the REAL kernel's figures for
+  // the same process, from wait4's rusage, for comparison.
+  long kern_minflt = 0;           // Linux minor page faults
+  long kern_majflt = 0;           // Linux major page faults
+  long kern_maxrss_kb = 0;        // Linux peak resident set size
+
   // ---- internals --------------------------------------------------------
   unsigned long use_seq = 0;  // recency counter: decides the "+" / "-" jobs
 

@@ -119,6 +119,16 @@ Shell::Shell(bool interactive, bool echo_input)
   sigfd_ = signalfd(-1, &set, SFD_NONBLOCK | SFD_CLOEXEC);
 
   install_scheduler_hooks();
+
+  // Deliverable 3: the system-call server for paged memory and semaphores.
+  kern.clock = [this] { return now_ms(); };
+  kern.on_block_change = [this] { cpu.reprobe(); };
+  kern.before_wake = [this](pid_t p) { cpu.wake(p); };
+  cpu.pid_hint = [this](pid_t p) { return kern.hint(p); };
+  cpu.wait_reason = [this](pid_t p) { return kern.wait_reason(p); };
+  std::string err;
+  if (!kern.start(err))
+    fprintf(stderr, "myshell: warning: memory/synchronization server unavailable: %s\n", err.c_str());
 }
 
 long Shell::now_ms() const { return proc::mono_ms() - start_ms_; }
@@ -174,11 +184,14 @@ std::string Shell::prompt() {
 // The event pump: the only place the shell sleeps
 // ---------------------------------------------------------------------------
 bool Shell::pump(long timeout_ms, bool watch_input) {
-  pollfd fds[2];
-  int n = 0;
-  fds[n++] = {sigfd_, POLLIN, 0};
-  if (watch_input) fds[n++] = {in_fd_, POLLIN, 0};
-  int r = poll(fds, n, (int)std::min<long>(timeout_ms, 1000000));
+  std::vector<pollfd> fds;
+  fds.push_back({sigfd_, POLLIN, 0});
+  if (watch_input) fds.push_back({in_fd_, POLLIN, 0});
+  const size_t k0 = fds.size();
+  kern.add_pollfds(fds);                       // the system-call server's sockets
+  long kt = kern.timeout_ms();                 // page I/O that completes, ...
+  if (kt >= 0 && (timeout_ms < 0 || kt < timeout_ms)) timeout_ms = kt;
+  int r = poll(fds.data(), fds.size(), (int)std::min<long>(timeout_ms, 1000000));
   bool input = false;
   if (r > 0) {
     if (fds[0].revents & POLLIN) {
@@ -187,7 +200,9 @@ bool Shell::pump(long timeout_ms, bool watch_input) {
         if (si.ssi_signo != SIGCHLD) pending_sigs_.push_back((int)si.ssi_signo);
     }
     if (watch_input && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) input = true;
+    kern.service(fds.data() + k0, fds.size() - k0);
   }
+  kern.tick();
   reap_children(false);
   schedule_tick();
   return input;
@@ -416,6 +431,7 @@ void Shell::child_exec(const Command& cmd, BuiltinFn fn, bool scheduled) {
   for (int s : {SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU, SIGCHLD, SIGPIPE}) signal(s, SIG_DFL);
   if (sigfd_ >= 0) close(sigfd_);
   cpu.forget_all();            // this copy of the scheduler belongs to the parent
+  kern.drop_inherited();       // ...and so do the memory and semaphores (the parent keeps serving them)
   if (scheduled) prctl(PR_SET_PDEATHSIG, SIGKILL);   // a stopped child must not outlive the shell
 
   // 3. Background jobs must not steal the shell's input: stdin <- /dev/null.
@@ -542,19 +558,12 @@ int Shell::wait_foreground_unscheduled(Job& job) {
   const int id = job.id;
   fg_job_id_ = id;
   give_terminal_to(job.pgid);
-  int status = 0;
-  struct rusage ru{};
-  pid_t r;
-  do {
-    r = wait4(job.pid, &status, WUNTRACED, &ru);
-  } while (r < 0 && errno == EINTR);
-  if (r < 0) {
-    fprintf(stderr, "myshell: wait4: %s\n", strerror(errno));
-    job.state = JobState::Done;
-    job.exit_status = 1;
-    job.finish = Job::Clock::now();
-  } else {
-    update_from_status(job, status, ru);
+  // Not a blocking wait4(): the shell keeps serving the system calls of its
+  // processes (the foreground job may be waiting for a semaphore or a page).
+  for (;;) {
+    Job* j = jobs.find_by_id(id);
+    if (!j || j->finished() || j->state == JobState::Stopped) break;
+    pump(-1, false);
   }
   return finish_foreground(id);
 }
@@ -597,6 +606,9 @@ int Shell::finish_foreground(int id) {
 void Shell::update_from_status(Job& job, int status, const struct rusage& ru) {
   job.cpu_user_ms = tv_ms(ru.ru_utime);
   job.cpu_sys_ms = tv_ms(ru.ru_stime);
+  job.kern_minflt = ru.ru_minflt;
+  job.kern_majflt = ru.ru_majflt;
+  job.kern_maxrss_kb = ru.ru_maxrss;
   if (WIFSTOPPED(status)) {
     job.state = JobState::Stopped;
     job.stop_signal = WSTOPSIG(status);
