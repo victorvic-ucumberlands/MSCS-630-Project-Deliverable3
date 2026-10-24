@@ -1,4 +1,4 @@
-# myshell - Deliverables 1-2: shell, process management, job control, CPU scheduling
+# myshell - Deliverables 1-3: shell, process management, job control, CPU scheduling, memory, synchronization
 
 C++17, Linux. Uses `fork`, `execvp`, `wait4`, `setpgid`, `tcsetpgrp`, `kill`, signals.
 
@@ -23,6 +23,12 @@ make sanitize           # optional: ASan+UBSan build (./myshell_asan)
 | `src/scheduler.{hpp,cpp}` | **Deliverable 2** - `sched run` experiments on the same scheduler (other jobs parked), with a measured report and Gantt chart |
 | `src/sched_builtin.cpp` | **Deliverable 2** - the `sched` built-in: live / policy / default / ps / trace, and add / list / remove / run / compare / stats |
 | `demos/cpuburn.c` | CPU-bound helper used as a scheduler workload; reports how much CPU time it has consumed |
+| `src/mkernel.h` | **Deliverable 3** - the "system call" interface between the shell and its processes (protocol + C client library + reference-string generators) |
+| `src/kernel.{hpp,cpp}` | **Deliverable 3** - the server: Unix socket, one connection per process (SO_PEERCRED), deferred replies = blocking, scheduler hints, cleanup on exit |
+| `src/memory.{hpp,cpp}` | **Deliverable 3** - paging: frames, page tables, demand paging, FIFO / LRU / Clock replacement, dirty bits, swap with one I/O device, shared segments; `mem sim` replay with OPT |
+| `src/sync.{hpp,cpp}` | **Deliverable 3** - counting semaphores and owned (robust) mutexes, FIFO wait queues or barging, wait-for-graph deadlock detection |
+| `src/mem_builtin.cpp` | **Deliverable 3** - the `mem` and `sem` built-ins |
+| `demos/memproc.c` `counter.c` `pc.c` `philo.c` `mktest.c` | **Deliverable 3** test programs: paging workload with data check, shared-counter race, producer-consumer, dining philosophers, API edge cases |
 
 ## The job record (`struct Job`, src/job.hpp)
 Identity (`id`, `serial`, `pid`, `pgid`, `command`), state (`New/Ready/Running/Stopped/Done/Terminated`,
@@ -68,6 +74,26 @@ Options: `-c MS` context-switch cost, `-T MS` time budget, `-v` verbose, `--quie
 `tests/verify_schedule.py ./myshell ./demos/cpuburn` checks 30 scheduler properties on real runs, including
 mutual exclusion sampled independently from `/proc`, for experiments and for ordinary commands.
 
+## Memory management and synchronization (Deliverable 3)
+
+The shell is the "kernel" for memory and semaphores. Every process it starts inherits `$MYSHELL_KERNEL`, the
+address of the shell's socket; a process that connects gets a paged virtual address space, and every load/store
+is a request the shell translates through the page table (like an MMU). A request the shell defers puts the
+process to sleep (semaphore wait, page fault with swap I/O) and the scheduler marks it BLOCKED.
+```
+mem config -f 4 -p 4096 -s 16 -d 0    # 4 frames of 4 KB, 16 swap pages, swap I/O 0 ms per page
+mem policy fifo|lru|clock             # page replacement (global)
+demos/memproc A 8 7,0,1,2,0,3 -v      # 8 pages, then that reference string ('3w' = write); data checked
+mem / mem frames / mem ps -a / mem pt %1 / mem trace on / mem stats
+mem sim -a all -f 1-7 1,2,3,4,1,2,5,1,2,3,4,5      # offline table, FIFO/LRU/Clock/OPT, Belady's anomaly
+demos/counter A 5000 & demos/counter B 5000 &      # race: lost updates (add --lock m for a mutex)
+demos/pc init 8; demos/pc producer 1 400 & demos/pc consumer 1 400 &; demos/pc check pc.log 1 400
+demos/philo 0 5 3 --naive|--ordered|--waiter ...   # dining philosophers (deadlock is detected)
+sem / sem create NAME [N] / sem post NAME / sem trace on / sem deadlock / sem config --deadlock fail --handoff barge
+```
+`tests/verify_memory.py ./myshell ./demos` checks 20 properties, including an independent Python implementation
+of FIFO/LRU/Clock/OPT against both `mem sim` and live processes. `demos/24_memory_perf.py` runs experiments M1-M5, S1-S3.
+
 ## Syntax
 `cmd &` background, `a ; b` sequence, `> >> < 2> 2>>` redirection, `'..'` `".."` `\x` quoting,
 `$VAR ${VAR} $? $$ ~`, `# comment`. Pipes, `&&`, `||` are rejected with a clear message (later deliverable).
@@ -81,7 +107,9 @@ through a pseudo-terminal. **Deliverable 2:** `15_live_sched.msh` (ordinary comm
 detection, `prio`, renice, job control through the scheduler, live off/on), `16_live_pty.py` (Ctrl-Z / Ctrl-C on a
 queued foreground job, interactive `cat` beside a CPU hog), `08_roundrobin.msh`, `09_priority.msh`,
 `10_sched_errors.msh`, `11_sched_limits.msh` (generated, 64 real processes), `12_sched_pty.py`, `13_performance.py`
-(experiments E1-E7). `run_demos.sh` runs everything and prints PASS/FAIL checks.
+(experiments E1-E7). **Deliverable 3:** `17_paging.msh`, `18_replacement.msh`, `19_mem_errors.msh`, `20_race.msh`,
+`21_producer_consumer.msh`, `22_dining.msh`, `23_sync_errors.msh`, `24_memory_perf.py`, `tests/verify_memory.py`.
+`run_demos.sh` runs everything and prints PASS/FAIL checks.
 
 For screenshots: run `./myshell` yourself in a terminal and type the commands from the demo scripts
 (or `./myshell -e demos/02_process_mgmt.msh` for a ready-made transcript).
@@ -93,3 +121,5 @@ For screenshots: run `./myshell` yourself in a terminal and type the commands fr
 * Blocking is detected by sampling `/proc` every 5 ms: a process that wakes up can run beside the dispatched one
   until the next probe (at most ~5 ms).
 * Built-ins run inside the shell and are not scheduled; a background `sched run ... &` is a separate scheduler.
+* Memory is simulated by the shell: only programs that use `src/mkernel.h` get paged memory (every access is a
+  request, so it is slow - tens of microseconds); the shell's memory model is cooperative, not hardware-enforced.
